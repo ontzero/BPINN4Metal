@@ -1,0 +1,270 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import shap
+
+# =============================
+# Global settings for plotting
+# =============================
+mpl.rcParams['font.family'] = 'Times New Roman'
+mpl.rcParams['font.size'] = 20  # Adjust font size if needed
+
+# =============================
+# 1. Data loading and preprocessing
+# =============================
+file_path = r"D:\Desktop\BPINN\dataset.xlsx"
+data = pd.read_excel(file_path, sheet_name='AMS')
+
+X = data[['Temp', 'LNS', 'R']].values
+y = data['LNN'].values
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Train-test split
+X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+
+# Convert to torch tensors
+X_train = torch.tensor(X_train, dtype=torch.float32, requires_grad=True)
+X_test = torch.tensor(X_test, dtype=torch.float32, requires_grad=True)
+y_train = torch.tensor(y_train, dtype=torch.float32).view(-1, 1)
+y_test = torch.tensor(y_test, dtype=torch.float32).view(-1, 1)
+
+# =============================
+# 2. Define Bayesian Linear Layer
+# =============================
+class BayesianLinear(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        # Parameters for weight distributions
+        self.w_mu = nn.Parameter(torch.Tensor(out_features, in_features).normal_(0, 1))
+        self.w_rho = nn.Parameter(torch.Tensor(out_features, in_features).normal_(-3, 1))
+
+        # Parameters for bias distributions
+        self.b_mu = nn.Parameter(torch.Tensor(out_features).normal_(0, 1))
+        self.b_rho = nn.Parameter(torch.Tensor(out_features).normal_(-3, 1))
+
+        # Standard normal distribution for sampling
+        self.normal = torch.distributions.Normal(0, 1)
+
+        # Variables to store sigma values
+        self.w_sigma = None
+        self.b_sigma = None
+
+    def forward(self, x):
+        # Compute sigma using softplus to ensure positivity
+        self.w_sigma = torch.log1p(torch.exp(self.w_rho))
+        self.b_sigma = torch.log1p(torch.exp(self.b_rho))
+
+        # Sample epsilon from standard normal distribution
+        w_epsilon = self.normal.sample(self.w_mu.shape)
+        b_epsilon = self.normal.sample(self.b_mu.shape)
+
+        # Reparameterization trick
+        weights = self.w_mu + self.w_sigma * w_epsilon
+        bias = self.b_mu + self.b_sigma * b_epsilon
+
+        # Compute KL divergence for loss function
+        self.kl_divergence = self._kl_divergence(self.w_mu, self.w_sigma) + \
+                             self._kl_divergence(self.b_mu, self.b_sigma)
+
+        return F.linear(x, weights, bias)
+
+    def _kl_divergence(self, mu, sigma):
+        # KL divergence between q(w) and standard normal prior p(w)
+        return -0.5 * torch.sum(1 + torch.log(sigma ** 2) - mu ** 2 - sigma ** 2)
+
+# =============================
+# 3. Define Bayesian Neural Network
+# =============================
+class BayesianNN(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(BayesianNN, self).__init__()
+        self.bayesian_linear1 = BayesianLinear(input_dim, hidden_dim)
+        self.bayesian_linear2 = BayesianLinear(hidden_dim, hidden_dim)
+        self.bayesian_linear3 = BayesianLinear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = F.relu(self.bayesian_linear1(x))
+        x = F.relu(self.bayesian_linear2(x))
+        x = self.bayesian_linear3(x)
+        return x
+
+    def kl_divergence(self):
+        # Sum of KL divergences from all layers
+        return self.bayesian_linear1.kl_divergence + \
+               self.bayesian_linear2.kl_divergence + \
+               self.bayesian_linear3.kl_divergence
+
+# =============================
+# 4. Define physical loss function
+# =============================
+def physical_loss(x, y_pred):
+    dN_dS = torch.autograd.grad(y_pred, x, grad_outputs=torch.ones_like(y_pred), create_graph=True)[0][:, 1]
+    d2N_dS2 = torch.autograd.grad(dN_dS, x, grad_outputs=torch.ones_like(dN_dS), create_graph=True)[0][:, 1]
+    dN_dR = torch.autograd.grad(y_pred, x, grad_outputs=torch.ones_like(y_pred), create_graph=True)[0][:, 2]
+    dN_dW = torch.autograd.grad(y_pred, x, grad_outputs=torch.ones_like(y_pred), create_graph=True)[0][:, 0]
+
+    loss = (
+        torch.mean(torch.relu(dN_dS)) +
+        torch.mean(torch.relu(-d2N_dS2)) +
+        torch.mean(torch.relu(-dN_dR)) +
+        torch.mean(torch.relu(dN_dW))
+    )
+    return loss
+
+# =============================
+# 5. Initialize Bayesian model
+# =============================
+model = BayesianNN(input_dim=3, hidden_dim=16, output_dim=1)
+
+# Separate mu and rho parameters for different optimizers
+mu_params = []
+rho_params = []
+for name, param in model.named_parameters():
+    if 'mu' in name:
+        mu_params.append(param)
+    elif 'rho' in name:
+        rho_params.append(param)
+
+optimizer_mu = optim.Adam(mu_params, lr=0.001)   # Optimizer for mean parameters
+optimizer_rho = optim.Adam(rho_params, lr=0.001) # Optimizer for variance parameters
+
+# =============================
+# 6. Training loop (with improved early stopping)
+# =============================
+num_epochs = 40000
+loss_values, kl_values, mse_values, phy_values = [], [], [], []
+
+coverage_threshold = 0.95   # Target coverage for combined condition
+mse_threshold = 0.001       # MSE improvement threshold
+patience_combined = 5       # Patience for combined condition
+patience_lowcov = 5         # Patience for very low coverage condition
+
+# Counters for early stopping
+combined_counter = 0        # coverage < 0.95 & mse_diff < threshold
+lowcov_counter = 0          # coverage < 0.9
+
+for epoch in range(num_epochs):
+    model.train()
+
+    # Zero gradients
+    optimizer_mu.zero_grad()
+    if epoch % 100 == 0:
+        optimizer_rho.zero_grad()
+
+    y_pred = model(X_train)
+
+    # Compute losses
+    mse_loss = F.mse_loss(y_pred, y_train)
+    phy_loss = physical_loss(X_train, y_pred)
+    kl_loss = model.kl_divergence() / len(X_train)  # Normalize KL loss
+
+    # Total loss = Data fit + KL divergence + Physical constraint
+    total_loss = mse_loss + 0.01 * kl_loss + 0.1 * phy_loss
+
+    # Backpropagation
+    total_loss.backward()
+
+    # Update parameters
+    optimizer_mu.step()
+    if epoch % 100 == 0:
+        optimizer_rho.step()
+
+    # Record loss values
+    loss_values.append(total_loss.item())
+    kl_values.append(kl_loss.item())
+    mse_values.append(mse_loss.item())
+    phy_values.append(phy_loss.item())
+
+    # Monitoring every 1000 epochs
+    if (epoch + 1) % 1000 == 0:
+        print(f"Epoch [{epoch + 1}/{num_epochs}], "
+              f"MSE Loss: {mse_loss.item():.4f}, "
+              f"KL Loss: {kl_loss.item():.4f}, "
+              f"Physical Loss: {phy_loss.item():.4f}")
+
+        # Evaluate confidence interval coverage on test set
+        y_pred_samples = []
+        with torch.no_grad():
+            for _ in range(100):  # Sample 100 predictions
+                y_pred_sample = model(X_test)
+                y_pred_samples.append(y_pred_sample.numpy())
+        y_pred_samples = np.array(y_pred_samples)
+
+        y_pred_lower = np.percentile(y_pred_samples, 2.5, axis=0)
+        y_pred_upper = np.percentile(y_pred_samples, 97.5, axis=0)
+
+        coverage = np.mean((y_pred_lower <= y_test.numpy()) & (y_pred_upper >= y_test.numpy()))
+        print(f"Confidence Interval Coverage: {coverage:.4f}")
+
+        # === Condition 1: coverage < 0.95 AND mse_diff < threshold (consecutive 5 times) ===
+        if len(mse_values) >= 2:
+            mse_diff = mse_values[-1] - mse_values[-2]
+
+            if coverage < coverage_threshold and mse_diff < mse_threshold:
+                combined_counter += 1
+                print(f"Combined early stopping counter: {combined_counter}/5")
+            else:
+                combined_counter = 0
+
+            if combined_counter >= patience_combined:
+                print("Early stopping: Coverage < 0.95 AND MSE improvement < threshold for 5 consecutive checks")
+                break
+
+        # === Condition 2: coverage < 0.9 (consecutive 5 times) ===
+        if coverage < 0.9:
+            lowcov_counter += 1
+            print(f"Low coverage counter: {lowcov_counter}/5")
+        else:
+            lowcov_counter = 0
+
+        if lowcov_counter >= patience_lowcov:
+            print("Early stopping: Coverage < 0.9 for 5 consecutive checks")
+            break
+
+# =============================
+# 7. Testing and uncertainty estimation
+# =============================
+model.eval()
+num_samples = 100
+y_pred_samples = []
+
+with torch.no_grad():
+    for _ in range(num_samples):
+        y_pred_test = model(X_test)
+        y_pred_samples.append(y_pred_test.numpy())
+y_pred_samples = np.array(y_pred_samples)
+
+# Compute 95% confidence intervals
+y_pred_lower = np.percentile(y_pred_samples, 2.5, axis=0)
+y_pred_upper = np.percentile(y_pred_samples, 97.5, axis=0)
+y_pred_mean = np.mean(y_pred_samples, axis=0)
+
+y_test_np = y_test.numpy()
+
+# Plot predicted vs true values with uncertainty
+plt.figure(figsize=(10, 6))
+plt.scatter(y_test_np, y_pred_mean, color='blue', label='Predicted Mean')
+plt.errorbar(y_test_np.squeeze(), y_pred_mean.squeeze(),
+             yerr=[y_pred_mean.squeeze() - y_pred_lower.squeeze(),
+                   y_pred_upper.squeeze() - y_pred_mean.squeeze()],
+             fmt='o', alpha=0.5, capsize=3, label='95% Confidence Interval')
+plt.plot([y_test_np.min(), y_test_np.max()], [y_test_np.min(), y_test_np.max()],
+         'r--', label='Ideal')
+plt.xlabel('True Values')
+plt.ylabel('Predicted Values')
+plt.title('Bayesian PINN: Predicted vs True with 95% Confidence Interval')
+plt.legend()
+plt.show()
