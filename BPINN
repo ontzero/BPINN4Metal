@@ -149,8 +149,8 @@ loss_values, kl_values, mse_values, phy_values = [], [], [], []
 
 coverage_threshold = 0.95   # Target coverage for combined condition
 mse_threshold = 0.001       # MSE improvement threshold
-patience_combined = 5       # Patience for combined condition
-patience_lowcov = 5         # Patience for very low coverage condition
+patience_combined = 3       # Patience for combined condition
+patience_lowcov = 3         # Patience for very low coverage condition
 
 # Counters for early stopping
 combined_counter = 0        # coverage < 0.95 & mse_diff < threshold
@@ -196,42 +196,47 @@ for epoch in range(num_epochs):
               f"Physical Loss: {phy_loss.item():.4f}")
 
         # Evaluate confidence interval coverage on test set
+       # === Evaluate coverage and stable MSE based on multiple samples ===
         y_pred_samples = []
         with torch.no_grad():
-            for _ in range(100):  # Sample 100 predictions
+            for _ in range(100):  # Sample 100 predictions for uncertainty estimation
                 y_pred_sample = model(X_test)
                 y_pred_samples.append(y_pred_sample.numpy())
         y_pred_samples = np.array(y_pred_samples)
 
+        # Mean prediction & 95% CI
+        y_pred_mean = np.mean(y_pred_samples, axis=0)
         y_pred_lower = np.percentile(y_pred_samples, 2.5, axis=0)
         y_pred_upper = np.percentile(y_pred_samples, 97.5, axis=0)
 
+        # Coverage
         coverage = np.mean((y_pred_lower <= y_test.numpy()) & (y_pred_upper >= y_test.numpy()))
         print(f"Confidence Interval Coverage: {coverage:.4f}")
 
-        # === Condition 1: coverage < 0.95 AND mse_diff < threshold (consecutive 5 times) ===
-        if len(mse_values) >= 2:
-            mse_diff = mse_values[-1] - mse_values[-2]
+        # Stable MSE (averaged over 100 samples)
+        stable_mse = mean_squared_error(y_test.numpy(), y_pred_mean)
+        print(f"Stable Test MSE: {stable_mse:.6f}")
 
-            if coverage < coverage_threshold and mse_diff < mse_threshold:
+        # === Early stopping logic ===
+        if len(mse_values) >= 1:
+            if coverage < coverage_threshold and abs(stable_mse - mse_values[-1]) < mse_threshold:
                 combined_counter += 1
-                print(f"Combined early stopping counter: {combined_counter}/5")
+                print(f"Combined early stopping counter: {combined_counter}/{patience_combined}")
             else:
                 combined_counter = 0
 
             if combined_counter >= patience_combined:
-                print("Early stopping: Coverage < 0.95 AND MSE improvement < threshold for 5 consecutive checks")
+                print("Early stopping: Coverage < 0.95 AND Stable MSE improvement < threshold for 3 consecutive checks")
                 break
 
-        # === Condition 2: coverage < 0.9 (consecutive 5 times) ===
         if coverage < 0.9:
             lowcov_counter += 1
-            print(f"Low coverage counter: {lowcov_counter}/5")
+            print(f"Low coverage counter: {lowcov_counter}/{patience_lowcov}")
         else:
             lowcov_counter = 0
 
         if lowcov_counter >= patience_lowcov:
-            print("Early stopping: Coverage < 0.9 for 5 consecutive checks")
+            print("Early stopping: Coverage < 0.9 for 3 consecutive checks")
             break
 
 # =============================
