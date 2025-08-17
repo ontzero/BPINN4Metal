@@ -210,41 +210,41 @@ for epoch in range(num_epochs):
         y_pred_upper = np.percentile(y_pred_samples, 97.5, axis=0)
 
         # Coverage
-        coverage = np.mean((y_pred_lower <= y_test.numpy()) & (y_pred_upper >= y_test.numpy()))
-        print(f"Confidence Interval Coverage: {coverage:.4f}")
+导入 torch
+import torch.nn as nn
 
-        # Stable MSE (averaged over 100 samples)
-        stable_mse = mean_squared_error(y_test.numpy(), y_pred_mean)
-        print(f"Stable Test MSE: {stable_mse:.6f}")
+import torch.optim as optim
+从 sklearn.preprocessing 导入 StandardScaler
+从 sklearn.model_selection 导入 train_test_split
 
-        # === Early stopping logic ===
-        if len(mse_values) >= 1:
-            if coverage < coverage_threshold and abs(stable_mse - mse_values[-1]) < mse_threshold:
-                combined_counter += 1
-                print(f"Combined early stopping counter: {combined_counter}/{patience_combined}")
+导入pandas库，命名为pd
+导入numpy库并命名为np
+导入 matplotlib.pyplot 作为 plt
+导入 matplotlib 作为 mpl
+导入 shap
             else:
-                combined_counter = 0
+# =============================
 
-            if combined_counter >= patience_combined:
-                print("Early stopping: Coverage < 0.95 AND Stable MSE improvement < threshold for 3 consecutive checks")
-                break
+# =============================
+mpl.rcParams['font.family'] = 'Times New Roman'
+mpl.rcParams['font.size'] = 20  # 调整字体大小（如有需要）
 
-        if coverage < 0.9:
-            lowcov_counter += 1
-            print(f"Low coverage counter: {lowcov_counter}/{patience_lowcov}")
-        else:
-            lowcov_counter = 0
+# =============================
+# 1. 数据加载和预处理
+# =============================
+file_path = r"D:\Desktop\BPINN\dataset.xlsx"
+data = pd.read_excel(file_path, sheet_name='AMS')
 
-        if lowcov_counter >= patience_lowcov:
-            print("Early stopping: Coverage < 0.9 for 3 consecutive checks")
+X = data[['Temp', 'LNS', 'R']].values
+y = data['LNN'].values
             break
 
-# =============================
+X_scaled = scaler.fit_transform(X)
 # 7. Testing and uncertainty estimation
-# =============================
-model.eval()
+# 训练-测试拆分
+X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
 num_samples = 100
-y_pred_samples = []
+# 转换为torch张量
 
 with torch.no_grad():
     for _ in range(num_samples):
